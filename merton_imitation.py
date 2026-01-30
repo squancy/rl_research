@@ -63,8 +63,8 @@ class MertonModel:
             R = (mu_t * self.params.delta_t +
                  self.params.sigma * self.params.delta_t ** 0.5 * epsilon)
 
-            X_new = X * (1 + self.params.r * self.params.delta_t + 
-                         pi * (R - self.params.r * self.params.delta_t))
+            X_new = torch.as_tensor(X * (1 + self.params.r * self.params.delta_t + 
+                pi * (R - self.params.r * self.params.delta_t)), dtype = torch.float32)
             trajectory.append((state, pi, X_new))
             X = X_new
             R_prev = R

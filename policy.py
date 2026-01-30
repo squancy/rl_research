@@ -11,23 +11,18 @@ class Policy(ABC, nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-    @abstractmethod
-    def __call__(self, *args, **kwargs) -> torch.Tensor:
-        """
-        Returns an action based on the state.
-        """
-        raise NotImplementedError("Unknown policy") 
-
 class LinearPolicy(Policy):
     """
     Defines a simple linear policy.
 
     Attributes:
         linear (nn.Linear): Linear layer.
+        pi_scale (float = 10.0): Scale parameter for the output.
     """
-    def __init__(self, in_features: int) -> None:
-        super(LinearPolicy, self).__init__()
+    def __init__(self, in_features: int, pi_scale: float = 10.0) -> None:
+        super().__init__()
         self.linear = nn.Linear(in_features, 1)
+        self.pi_scale = pi_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -39,10 +34,7 @@ class LinearPolicy(Policy):
         Returns:
             nn.Tensor: Result after forward propagating the input vector. 
         """
-        return self.linear(x)
-
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
+        return self.pi_scale * torch.tanh(self.linear(x))
 
 class NormalizedPolicy(Policy):
     """
@@ -54,7 +46,7 @@ class NormalizedPolicy(Policy):
         std (torch.Tensor): Variance of the input data.
     """
     def __init__(self, policy: Policy, mean: torch.Tensor, std: torch.Tensor) -> None:
-        super(NormalizedPolicy, self).__init__()
+        super().__init__()
         self.policy = policy
         self.mean = mean
         self.std = std
@@ -72,9 +64,6 @@ class NormalizedPolicy(Policy):
         x = (x - self.mean) / self.std
         return self.policy(x)
     
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
-
 class MertonPolicy(Policy):
     """
     Implements the optimal policy for the Merton Asset Price model.
@@ -83,9 +72,10 @@ class MertonPolicy(Policy):
         params (MertonConsts): Dataclass of constants for the Merton AP model.
     """
     def __init__(self, params: MertonConsts) -> None:
+        super().__init__()
         self.params = params
 
-    def __call__(self, *args, **kwargs) -> torch.Tensor:
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         """
         Computes optimal policy for the Merton AP model (it does not depend on the state).
 
@@ -108,7 +98,7 @@ class TimeDependentMertonPolicy(MertonPolicy):
     def __init__(self, params: MertonConsts) -> None:
         super().__init__(params = params)
 
-    def __call__(self, state: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
         Computes the optimal policy for the time-dependent Merton AP model.
 
@@ -140,7 +130,7 @@ class TimeDependentNoisyMertonPolicy(MertonPolicy):
         self.var = var
         self.seed = seed
 
-    def __call__(self, state: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
         Computes the optimal policy for the time-dependent Merton AP model.
 
@@ -157,3 +147,47 @@ class TimeDependentNoisyMertonPolicy(MertonPolicy):
             (self.params.gamma * self.params.sigma ** 2) + self.var * rng.standard_normal(),
             dtype = torch.float32
         )
+
+class NNPolicy(Policy):
+    """
+    Neural Network policy with two layers.
+
+    Attributes:
+        net (nn.Sequential): 2-layer NN with a 64-dim hidden layer.
+        pi_scale (float = 10.0): Scale parameter for the output.
+    """
+    def __init__(self, in_dim: int, pi_scale: float = 20.0) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        self.pi_scale = pi_scale
+    
+    def forward(self, state) -> torch.Tensor:
+        return self.pi_scale * torch.tanh(self.net(state))
+    
+class MixturePolicy(Policy):
+    """
+    Implements the convex combination of two policies.
+    Returns the first policy with probability threshold.
+
+    Attributes:
+        policy1 (Policy): First policy.
+        policy2 (Policy): Second policy.
+        threshold (float): Convex combination coefficient.
+    """
+    def __init__(self, policy1: Policy, policy2: Policy, threshold: float) -> None:
+        super().__init__()
+
+        self.policy1 = policy1
+        self.policy2 = policy2
+        self.threshold = threshold
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if np.random.rand() < self.threshold:
+            return self.policy1(x)
+        return self.policy2(x)

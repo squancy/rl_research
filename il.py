@@ -19,20 +19,49 @@ class ExpertDataset(Dataset):
         std (torch.Tensor): Variance of the input data.
         states (torch.Tensor): Normalized states.
     """
-    def __init__(self, data: list[tuple]) -> None:
+    def __init__(
+            self,
+            data: list[tuple],
+            mean: torch.Tensor | None = None,
+            std: torch.Tensor | None = None
+        ) -> None:
         X = torch.stack([x[0] for x in data]).float()
-        self.actions = torch.stack([x[1] for x in data]).float().unsqueeze(1)
-        self.mean = X.mean(dim = 0)
-        self.std = X.std(dim = 0) + 1e-8
+        self.actions = torch.stack([
+            torch.as_tensor(
+                x[1],
+                dtype=torch.float32
+            ).view(1) for x in data]).float()
+        
+        if mean is None or std is None:
+            self.mean = X.mean(dim = 0)
+            self.std = X.std(dim = 0) + 1e-8
+        else:
+            self.mean = mean
+            self.std = std
         self.states = ((X - self.mean) / self.std).float()
     
-    def add(self, new_data: list[tuple]):
+    def add(
+            self,
+            states: list[torch.Tensor],
+            actions: list[torch.Tensor]
+        ) -> None:
         """
-        Adds new data to the dataset.
-        """
-        pass
+        Adds data to the dataset. Uses the mean and variance
+        of the instance.
 
-    def __len__(self):
+        Args:
+            states (list[torch.Tensor]): List of (state, action) paris to add.
+        """
+        s = torch.stack(states)
+        a = torch.stack([
+            torch.as_tensor(
+                action,
+                dtype=torch.float32).view(1) for action in actions
+            ]).float()
+        self.states = torch.cat([self.states, (s - self.mean) / self.std])
+        self.actions = torch.cat([self.actions, a])
+    
+    def __len__(self) -> int:
         return len(self.states)
     
     def __getitem__(self, idx: int):
@@ -67,31 +96,54 @@ class DAgger:
         self.policy = policy
         self.expert_policy = expert_policy_class(params = params)
         self.K = K
+        self.expert_policy.eval()
+        for p in self.expert_policy.parameters():
+            p.requires_grad_(False)
     
     def train(self):
         """
         Trains DAgger on the expert dataset.
         """
-        bc = BC(D = self.expert_dataset, policy = self.policy)
+        self.bc = BC(
+            D = self.expert_dataset,
+            policy = self.policy,
+            lr = 3e-4,
+            optimizer = "adam"
+        )
+        N_0 = len(cast(Sized, self.bc.dataloader.dataset))
         for t in range(self.epochs):
+            print(f"DAgger Epoch {t + 1}\n-------------------------")
+            N_t = len(cast(Sized, self.bc.dataloader.dataset))
+            E_t = int(min(50, np.ceil(10 * N_t / N_0)))
+            self.bc.epochs = E_t
+            lr_t = 3e-4 * np.sqrt(N_0 / N_t)
+            for g in self.bc.optimizer.param_groups:
+                g["lr"] = lr_t
+            self.bc.dataloader = DataLoader(
+                self.bc.dataset,
+                batch_size=self.bc.dataloader.batch_size,
+                shuffle=True
+            )
+            self.bc.train()
+            mixture_policy = MixturePolicy(
+                policy1=self.expert_policy,
+                policy2=self.bc.policy,
+                threshold=max(0.0, 1.0 - t / self.epochs)
+            )
             for k in range(5):
-                print(f"Epoch {t + 1}\n-------------------------")
-                bc = BC(D = self.expert_dataset, policy = self.policy)
-                bc.train()
-                traj = self.merton_model.simulate_trajectory(policy = bc.policy, seed = k)
-
+                with torch.no_grad():
+                    traj = self.merton_model.simulate_trajectory(
+                        policy = mixture_policy,
+                        seed = k * t
+                    )
                 states = []
                 expert_actions = []
-                beta = max(0.1, 1.0 - k / self.K)
                 for state, _, _ in traj:
-                    if np.random.rand() < beta:
+                    with torch.no_grad():
                         a_star = self.expert_policy(state)
-                    else:
-                        a_star = bc.policy(state)
-                    states.append(state)
-                    expert_actions.append(a_star)
-                self.expert_dataset.extend(zip(states, expert_actions)) 
-        self.policy = bc.policy
+                    states.append(state.detach().clone())
+                    expert_actions.append(a_star.detach().clone())
+                self.bc.dataset.add(states=states, actions=expert_actions)
                 
 class BC:
     """
@@ -112,13 +164,23 @@ class BC:
             policy: Policy,
             lr: float = 0.001,
             epochs: int = 10,
-            batch_size: int = 32
+            batch_size: int = 32,
+            optimizer: str = "sgd",
+            dataset_mean: torch.Tensor | None = None,
+            dataset_std: torch.Tensor | None = None
         ) -> None:
         self.policy = policy
         self.epochs = epochs
         self.loss_fn = nn.MSELoss()
-        self.optimizer = optim.SGD(self.policy.parameters(), lr = lr)
-        self.dataset = ExpertDataset(data = D)
+        if optimizer == "sgd":
+            self.optimizer = optim.SGD(self.policy.parameters(), lr = lr)
+        elif optimizer == "adam":
+            self.optimizer = optim.Adam(self.policy.parameters(), lr = lr)
+        self.dataset = ExpertDataset(
+            data = D,
+            mean = dataset_mean,
+            std = dataset_std
+        )
         self.dataloader = DataLoader(
             self.dataset,
             batch_size = batch_size,
@@ -207,10 +269,9 @@ if __name__ == "__main__":
         bc_policy = LinearPolicy(in_features = 3)
     )
 
-    """
     # Model misspecification
     merton_model = create_model(policy_class = TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m = 200)
+    expert_dataset = merton_model.generate_data(m = 100)
     bc = BC(D = expert_dataset, policy = LinearPolicy(in_features = 3), epochs = 10)
     bc.train()
     merton_model.params.A = 0.66
@@ -218,7 +279,13 @@ if __name__ == "__main__":
 
     merton_model = create_model(policy_class = TimeDependentMertonPolicy)
     expert_dataset = merton_model.generate_data(m = 200)
-    bc = BC(D = expert_dataset, policy = LinearPolicy(in_features = 4), epochs = 10)
+    bc = BC(D = expert_dataset, policy = LinearPolicy(in_features = 3), epochs = 10)
     bc.train()
     merton_model.params.sigma = 0.8
     bc.compare_to_merton(merton_model)
+    """
+
+    dagger = DAgger(expert_policy_class = TimeDependentMertonPolicy, policy = NNPolicy(in_dim = 3))
+    dagger.train()
+    merton_model = create_model(policy_class = TimeDependentMertonPolicy)
+    dagger.bc.compare_to_merton(merton_model=merton_model)
