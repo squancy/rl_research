@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
 from torch.utils.data import Dataset, DataLoader
-from merton_imitation import create_model, MertonModel
+from merton_imitation import create_merton_model, MertonModel
+from jump_diffusion_imitation import create_jump_diffusion_model, JumpDiffusionModel
 from policy import *
 from plots import Plots
-from typing import Type
-from typing import cast
+from typing import Type, cast
 from collections.abc import Sized
+from financial_model import FinancialModel
 
 class ExpertDataset(Dataset):
     """
@@ -72,7 +74,7 @@ class DAgger:
     DAgger implementation.
 
     Attributes:
-        merton_model (MertonModel): Merton AP model with the expert policy.
+        financial_model (FinancialModel): Financial model with the expert policy.
         expert_dataset (list[tuple[Tensor, Tensor]]): Expert trajectories.
         epochs (int = 10): Number of epochs during training.
         batch_size (int = 32): Batch size.
@@ -82,19 +84,28 @@ class DAgger:
     """
     def __init__(
             self,
-            expert_policy_class: Type[Policy],
             policy: Policy,
             epochs: int = 10,
             batch_size: int = 32,
-            K: int = 5
+            K: int = 5,
+            expert_policy: str = "merton",
         ) -> None:
-        params = MertonConsts()
-        self.merton_model = create_model(policy_class = expert_policy_class)
-        self.expert_dataset = self.merton_model.generate_data(m = 100)
+        if expert_policy == "merton":
+            self.financial_model = create_merton_model(
+                policy_class = MertonPolicy
+            )
+            self.expert_policy = MertonPolicy(params = MertonConsts())
+        elif expert_policy == "jump_diffusion":
+            self.financial_model = create_jump_diffusion_model(
+                policy_class = JumpDiffusionPolicy
+            )
+            self.expert_policy = JumpDiffusionPolicy(
+                params = JumpDiffusionConsts()
+            )
+        self.expert_dataset = self.financial_model.generate_data(m = 100)
         self.epochs = epochs
         self.batch_size = batch_size
         self.policy = policy
-        self.expert_policy = expert_policy_class(params = params)
         self.K = K
         self.expert_policy.eval()
         for p in self.expert_policy.parameters():
@@ -130,11 +141,11 @@ class DAgger:
                 policy2=self.bc.policy,
                 threshold=max(0.0, 1.0 - t / self.epochs)
             )
-            for k in range(5):
+            for k in range(self.K):
                 with torch.no_grad():
-                    traj = self.merton_model.simulate_trajectory(
+                    traj = self.financial_model.simulate_trajectory(
                         policy = mixture_policy,
-                        seed = k * t
+                        seed = t * self.K + k
                     )
                 states = []
                 expert_actions = []
@@ -206,12 +217,12 @@ class BC:
                     total = len(cast(Sized, self.dataloader.dataset))
                     print(f"Loss: {loss.item():.4f} [{batch * len(X)}/{total}]")
 
-    def compare_to_merton(self, merton_model: MertonModel):
+    def compare_to_financial_model(self, financial_model: FinancialModel):
         """
-        Compares BC to a given Merton AP model by plotting useful metrics. 
+        Compares BC to a given financial model by plotting useful metrics. 
 
         Args:
-            merton_model (MertonModel): The Merton AP model to use.
+            financial_model (FinancialModel): The financial model to use.
         """
         normalized_bc_policy = NormalizedPolicy(
             policy = self.policy,
@@ -224,68 +235,87 @@ class BC:
         with torch.no_grad():
             plots.loss_training_step(losses = self.losses)
             
-            expert_traj = merton_model.simulate_trajectory(policy = merton_model.policy)
-            policy_traj = merton_model.simulate_trajectory(policy = normalized_bc_policy)
+            expert_traj = financial_model.simulate_trajectory(policy = financial_model.policy)
+            policy_traj = financial_model.simulate_trajectory(policy = normalized_bc_policy)
             plots.action_time(expert_traj = expert_traj, policy_traj = policy_traj)
 
-            X_expert = merton_model.terminal_wealths(policy = merton_model.policy, m = 100)
-            X_policy = merton_model.terminal_wealths(policy = self.policy, m = 100)
+            X_expert = financial_model.terminal_wealths(policy = financial_model.policy, m = 100)
+            X_policy = financial_model.terminal_wealths(policy = self.policy, m = 100)
             plots.terminal_wealth_distr(X_expert = X_expert, X_policy = X_policy)
 
-            expert_eval = merton_model.evaluate(policy = merton_model.policy, m = 100)
-            bc_eval = merton_model.evaluate(policy = normalized_bc_policy, m = 100)
+            expert_eval = financial_model.evaluate(policy = financial_model.policy, m = 100)
+            bc_eval = financial_model.evaluate(policy = normalized_bc_policy, m = 100)
             plots.expected_utility(U_expert = expert_eval, U_policy = bc_eval) 
             
-            traj = merton_model.simulate_trajectory(policy = normalized_bc_policy)
+            traj = financial_model.simulate_trajectory(policy = normalized_bc_policy)
             states = [step[0] for step in traj]
-            errors = merton_model.policy_diff(policy = self.policy, states = states)
+            errors = financial_model.policy_diff(policy = self.policy, states = states)
             plots.rollout_drift(errors = errors)
 
-def compare_bc_to_merton(merton_policy_class: Type[Policy], bc_policy: Policy):
+def compare_bc_to_fin_model(financial_policy_class: Type[Policy], bc_policy: Policy):
     """
-    Compares BC to a given Merton AP model.
+    Compares BC to a given financial model.
 
     Args:
-        merton_policy_class (Policy): Merton policy class to use.
+        financial_policy_class (Policy): Financial policy class to use.
         bc_policy (Policy): BC policy to use.
     """
-    merton_model = create_model(policy_class = merton_policy_class)
-    expert_dataset = merton_model.generate_data(m = 100)
+    if financial_policy_class in [MertonPolicy, TimeDependentMertonPolicy, TimeDependentNoisyMertonPolicy]:
+        fin_model = create_merton_model(policy_class = financial_policy_class)
+    elif financial_policy_class == JumpDiffusionPolicy:
+        fin_model = create_jump_diffusion_model(policy_class = JumpDiffusionPolicy)
+    expert_dataset = fin_model.generate_data(m = 100)
     bc = BC(D = expert_dataset, policy = bc_policy, epochs = 10)
     bc.train()
-    bc.compare_to_merton(merton_model)
+    bc.compare_to_financial_model(financial_model=fin_model)
 
 if __name__ == "__main__":
     """
-    # MertonPolicy
-    compare_bc_to_merton(
-        merton_policy_class = MertonPolicy,
+    # Evaluate behavior cloning using the Merton model
+    compare_bc_to_fin_model(
+        financial_policy_class=MertonPolicy,
         bc_policy = LinearPolicy(in_features = 3)
     )
     
-    # TimeDependentMertonPolicy
-    compare_bc_to_merton(
-        merton_policy_class = TimeDependentMertonPolicy,
+    # Evaluate behavior cloning using the time-dependent Merton model
+    compare_bc_to_fin_model(
+        financial_policy_class=TimeDependentMertonPolicy,
         bc_policy = LinearPolicy(in_features = 3)
     )
 
-    # Model misspecification
-    merton_model = create_model(policy_class = TimeDependentMertonPolicy)
+    # Distribution shift
+    # Evaluate the time-dependent Merton model using a different
+    # risky asset return than it was trained on
+    merton_model = create_merton_model(policy_class = TimeDependentMertonPolicy)
     expert_dataset = merton_model.generate_data(m = 100)
     bc = BC(D = expert_dataset, policy = LinearPolicy(in_features = 3), epochs = 10)
     bc.train()
     merton_model.params.A = 0.66
-    bc.compare_to_merton(merton_model)
+    bc.compare_to_financial_model(financial_model=merton_model)
 
-    merton_model = create_model(policy_class = TimeDependentMertonPolicy)
+    # Evaluate the time-dependent Merton model using a different
+    # risky asset volatility than it was trained on
+    merton_model = create_merton_model(policy_class = TimeDependentMertonPolicy)
     expert_dataset = merton_model.generate_data(m = 200)
     bc = BC(D = expert_dataset, policy = LinearPolicy(in_features = 3), epochs = 10)
     bc.train()
     merton_model.params.sigma = 0.8
-    bc.compare_to_merton(merton_model)
+    bc.compare_to_financial_model(financial_model=merton_model)
+
+    dagger = DAgger(expert_policy = "merton", policy = NNPolicy(in_dim = 3))
+    dagger.train()
+    merton_model = create_merton_model(policy_class = TimeDependentMertonPolicy)
+    merton_model.params.sigma = 0.8
+    dagger.bc.compare_to_financial_model(financial_model=merton_model)
     """
 
-    dagger = DAgger(expert_policy_class = TimeDependentMertonPolicy, policy = NNPolicy(in_dim = 3))
+    dagger = DAgger(
+        policy = NNPolicy(in_dim = 3),
+        expert_policy="jump_diffusion"
+    )
     dagger.train()
-    merton_model = create_model(policy_class = TimeDependentMertonPolicy)
-    dagger.bc.compare_to_merton(merton_model=merton_model)
+    jd_model = create_jump_diffusion_model(policy_class = JumpDiffusionPolicy)
+    jd_model.params.lam = 0.75
+    jd_model.params.mu_J = 0.2
+    jd_model.params.sigma_J = 0.25
+    dagger.bc.compare_to_financial_model(financial_model=jd_model)

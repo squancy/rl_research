@@ -1,10 +1,9 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from abc import ABC, abstractmethod
-from consts import MertonConsts
+from consts import MertonConsts, JumpDiffusionConsts
 
-class Policy(ABC, nn.Module):
+class Policy(nn.Module):
     """
     Abstract class for defining policies.
     """
@@ -182,7 +181,6 @@ class MixturePolicy(Policy):
     """
     def __init__(self, policy1: Policy, policy2: Policy, threshold: float) -> None:
         super().__init__()
-
         self.policy1 = policy1
         self.policy2 = policy2
         self.threshold = threshold
@@ -191,3 +189,22 @@ class MixturePolicy(Policy):
         if np.random.rand() < self.threshold:
             return self.policy1(x)
         return self.policy2(x)
+
+class JumpDiffusionPolicy(Policy):
+    """
+    Implements the optimal policy for the Jump Diffusion model.
+
+    Attributes:
+        params (JumpDiffusionConsts): Parameters of the Jump Diffusion model.
+    """
+    def __init__(self, params: JumpDiffusionConsts):
+        super().__init__()
+        self.params = params
+    
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        E_jump = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J ** 2) - 1
+        Var_jump = ((np.exp(self.params.sigma_J ** 2) - 1) *
+            np.exp(2 * self.params.mu_J + self.params.sigma_J ** 2))
+        return torch.as_tensor(self.params.mu - self.params.r - self.params.lam * E_jump /
+                (self.params.gamma * self.params.sigma ** 2 +
+                 self.params.lam * Var_jump), dtype=torch.float32)

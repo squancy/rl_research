@@ -1,29 +1,25 @@
 import numpy as np
 import torch
 from typing import Type
-from consts import MertonConsts
-from policy import Policy, MertonPolicy
+from consts import JumpDiffusionConsts
+from policy import Policy
 from financial_model import FinancialModel
 
-class MertonModel(FinancialModel):
+class JumpDiffusionModel(FinancialModel):
     """
-    Implements the Merton AP model and trajectory generation according
+    Implements the Jump Diffusion AP model and trajectory generation according
     to the model.
 
     Attributes:
-        params (MertonConsts): Dataclass of constants for the Merton AP model.
-        policy_class (Policy): Optimal policy class for the Merton AP model.
-        time_dep (bool): True, if the Merton policy is time-dependent.
+        params (JumpDiffusionConsts): Dataclass of constants for the Jump Diffusion AP model.
+        policy_class (Policy): Optimal policy class for the Jump Diffusion AP model.
     """
     def __init__(
             self,
-            params: MertonConsts,
+            params: JumpDiffusionConsts,
             policy_class: Type[Policy]
         ) -> None:
         self.params = params
-        self.time_dep = True
-        if policy_class == Type[MertonPolicy]:
-            self.time_dep = False
         self.policy = policy_class(params = params)
 
     def simulate_trajectory(self, policy: Policy, seed: int = 42) -> list[tuple]:
@@ -42,42 +38,43 @@ class MertonModel(FinancialModel):
         rng = np.random.default_rng(seed = seed)
         X = self.params.init_wealth
         N = int(self.params.T / self.params.delta_t)
-        R_prev = 0
         trajectory = []
 
         for t in range(N):
-            if self.time_dep:
-                mu_t = self.params.mu + self.params.A * np.sin(2 * np.pi * t / N)
-                state = torch.as_tensor([t / N, mu_t, torch.log(X.item())], dtype = torch.float32)
+            state = torch.as_tensor([t / N, self.params.mu, torch.log(X.item())], dtype=torch.float32)
+            J_t = rng.poisson(self.params.lam * self.params.delta_t)
+            if J_t == 1:
+                jump = np.exp(
+                    self.params.mu_J +
+                    self.params.sigma_J * rng.standard_normal()
+                )
             else:
-                mu_t = self.params.mu
-                state = torch.tensor([t / N, R_prev, torch.log(X.item())], dtype = torch.float32)
-
+                jump = 1.0
             pi = policy(state)
 
             epsilon = rng.standard_normal()
-            R = (mu_t * self.params.delta_t +
-                 self.params.sigma * self.params.delta_t ** 0.5 * epsilon)
+            R = (self.params.mu * self.params.delta_t +
+                 self.params.sigma * self.params.delta_t ** 0.5 * epsilon +
+                 (jump - 1))
 
             X_new = torch.as_tensor(X * (1 + self.params.r * self.params.delta_t + 
                 pi * (R - self.params.r * self.params.delta_t)), dtype = torch.float32)
             trajectory.append((state, pi, X_new))
             X = X_new
-            R_prev = R
         return trajectory
 
-def create_merton_model(policy_class: Type[Policy]) -> MertonModel:
+def create_jump_diffusion_model(policy_class: Type[Policy]) -> JumpDiffusionModel:
     """
-    Creates the Merton model with a given policy.
+    Creates the Jump Diffusion model with a given policy.
 
     Args:
-        policy_class (Policy): Policy to use in the Merton AP model.
+        policy_class (Policy): Policy to use in the Jump Diffusion AP model.
 
     Returns:
-        MertonModel: The Merton model.
+        JumpDiffusionModel: The Jump Diffusion model.
     """
-    params = MertonConsts()
-    merton_model = MertonModel(
+    params = JumpDiffusionConsts()
+    merton_model = JumpDiffusionModel(
         params = params,
         policy_class = policy_class
     )
