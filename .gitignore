@@ -3,6 +3,9 @@ include/
 lib/
 share/
 pyvenv.cfg
+.github
+.vscode
+pyproject.toml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

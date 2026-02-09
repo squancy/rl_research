@@ -1,18 +1,43 @@
 from dataclasses import dataclass
 
+
+@dataclass
+class SystemConsts:
+    """
+    A data class for storing system constants.
+
+    Attributes:
+        train_base_seed (int): Base seed for training.
+        test_base_seed_expert (int): Base seed for testing the expert policy.
+        test_base_seed_policy (int): Base seed for testing the learned policy.
+        terminal_wealth_base_seed_expert (int): Base seed for calculating terminal wealths using the expert policy.
+        terminal_wealth_base_seed_policy (int): Base seed for calculating terminal wealths using the learned policy.
+        dagger_base_seed (int): Base seed for DAgger.
+    """
+
+    train_base_seed: int = 1_000
+    test_base_seed_expert: int = 2_000
+    test_base_seed_policy: int = 3_000
+    terminal_wealth_base_seed_expert: int = 4_000
+    terminal_wealth_base_seed_policy: int = 5_000
+    dagger_base_seed: int = 6_000
+
+
 @dataclass
 class GeneralConsts:
     """
     A data class for storing general constants.
-    
+
     Attributes:
         init_wealth (float): Initial wealth.
         delta_t (float): Time step.
         T (int): Total horizon in years.
     """
+
     init_wealth: float = 1.0
-    delta_t: float = 1 / 250 # daily
+    delta_t: float = 1 / 250  # daily
     T: int = 1
+
 
 @dataclass
 class MertonConsts(GeneralConsts):
@@ -26,11 +51,13 @@ class MertonConsts(GeneralConsts):
         gamma (float): Risk aversion.
         A (float): Hyperparameter for determining time dependent risky return.
     """
+
     mu: float = 0.08
     r: float = 0.02
     sigma: float = 0.2
     gamma: float = 5
     A: float = 0.08
+
 
 @dataclass
 class JumpDiffusionConsts(GeneralConsts):
@@ -46,6 +73,7 @@ class JumpDiffusionConsts(GeneralConsts):
         mu_J (float): Mean of jump.
         sigma_J (float): Variance of jump.
     """
+
     mu: float = 0.08
     r: float = 0.02
     sigma: float = 0.2

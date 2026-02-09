@@ -1,14 +1,18 @@
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from consts import MertonConsts, JumpDiffusionConsts
+
+from consts import JumpDiffusionConsts, MertonConsts
+
 
 class Policy(nn.Module):
     """
     Abstract class for defining policies.
     """
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
 
 class LinearPolicy(Policy):
     """
@@ -18,6 +22,7 @@ class LinearPolicy(Policy):
         linear (nn.Linear): Linear layer.
         pi_scale (float = 10.0): Scale parameter for the output.
     """
+
     def __init__(self, in_features: int, pi_scale: float = 10.0) -> None:
         super().__init__()
         self.linear = nn.Linear(in_features, 1)
@@ -26,14 +31,15 @@ class LinearPolicy(Policy):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Does a single step of forward propagation.
-        
+
         Args:
             x (torch.Tensor): Input vector.
 
         Returns:
-            nn.Tensor: Result after forward propagating the input vector. 
+            nn.Tensor: Result after forward propagating the input vector.
         """
         return self.pi_scale * torch.tanh(self.linear(x))
+
 
 class NormalizedPolicy(Policy):
     """
@@ -44,6 +50,7 @@ class NormalizedPolicy(Policy):
         mean (torch.Tensor): Mean vector of the input data.
         std (torch.Tensor): Variance of the input data.
     """
+
     def __init__(self, policy: Policy, mean: torch.Tensor, std: torch.Tensor) -> None:
         super().__init__()
         self.policy = policy
@@ -56,13 +63,14 @@ class NormalizedPolicy(Policy):
 
         Args:
             x (torch.Tensor): Input vector.
-        
+
         Returns:
             torch.Tensor: Value of policy at the normalized input.
         """
         x = (x - self.mean) / self.std
         return self.policy(x)
-    
+
+
 class MertonPolicy(Policy):
     """
     Implements the optimal policy for the Merton Asset Price model.
@@ -70,6 +78,7 @@ class MertonPolicy(Policy):
     Attributes:
         params (MertonConsts): Dataclass of constants for the Merton AP model.
     """
+
     def __init__(self, params: MertonConsts) -> None:
         super().__init__()
         self.params = params
@@ -82,10 +91,11 @@ class MertonPolicy(Policy):
             torch.Tensor: Optimal policy for the Merton model.
         """
         return torch.as_tensor(
-            (self.params.mu - self.params.r) /
-            (self.params.gamma * self.params.sigma ** 2),
-            dtype = torch.float32
+            (self.params.mu - self.params.r)
+            / (self.params.gamma * self.params.sigma**2),
+            dtype=torch.float32,
         )
+
 
 class TimeDependentMertonPolicy(MertonPolicy):
     """
@@ -94,8 +104,9 @@ class TimeDependentMertonPolicy(MertonPolicy):
     Attributes:
         params (MertonConsts): Dataclass of constants for the Merton AP model.
     """
+
     def __init__(self, params: MertonConsts) -> None:
-        super().__init__(params = params)
+        super().__init__(params=params)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
@@ -107,12 +118,12 @@ class TimeDependentMertonPolicy(MertonPolicy):
         Returns:
             torch.Tensor: Optimal policy for the Merton model at time step t.
         """
-        mu_t = state[1]
+        mu_t = self.params.mu + self.params.A * np.sin(2 * np.pi * state[0])
         return torch.as_tensor(
-            (mu_t - self.params.r) /
-            (self.params.gamma * self.params.sigma ** 2),
-            dtype = torch.float32
+            (mu_t - self.params.r) / (self.params.gamma * self.params.sigma**2),
+            dtype=torch.float32,
         )
+
 
 class TimeDependentNoisyMertonPolicy(MertonPolicy):
     """
@@ -124,10 +135,12 @@ class TimeDependentNoisyMertonPolicy(MertonPolicy):
         var (float): Variance of standard noise.
         seed (int): Random seed for noise generation.
     """
+
     def __init__(self, params: MertonConsts, var: float = 0.07, seed: int = 42) -> None:
-        super().__init__(params = params)
+        super().__init__(params=params)
         self.var = var
         self.seed = seed
+        self.rng = np.random.default_rng(seed=seed)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
@@ -140,12 +153,12 @@ class TimeDependentNoisyMertonPolicy(MertonPolicy):
             torch.Tensor: Optimal policy for the Merton model at time step t.
         """
         mu_t = state[1]
-        rng = np.random.default_rng(seed = self.seed)
         return torch.as_tensor(
-            (mu_t - self.params.r) /
-            (self.params.gamma * self.params.sigma ** 2) + self.var * rng.standard_normal(),
-            dtype = torch.float32
+            (mu_t - self.params.r) / (self.params.gamma * self.params.sigma**2)
+            + self.var * self.rng.standard_normal(),
+            dtype=torch.float32,
         )
+
 
 class NNPolicy(Policy):
     """
@@ -155,6 +168,7 @@ class NNPolicy(Policy):
         net (nn.Sequential): 2-layer NN with a 64-dim hidden layer.
         pi_scale (float = 10.0): Scale parameter for the output.
     """
+
     def __init__(self, in_dim: int, pi_scale: float = 20.0) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -162,13 +176,14 @@ class NNPolicy(Policy):
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
         self.pi_scale = pi_scale
-    
+
     def forward(self, state) -> torch.Tensor:
         return self.pi_scale * torch.tanh(self.net(state))
-    
+
+
 class MixturePolicy(Policy):
     """
     Implements the convex combination of two policies.
@@ -178,17 +193,29 @@ class MixturePolicy(Policy):
         policy1 (Policy): First policy.
         policy2 (Policy): Second policy.
         threshold (float): Convex combination coefficient.
+        rng (np.random.Generator | None): RNG for reproducible sampling.
     """
-    def __init__(self, policy1: Policy, policy2: Policy, threshold: float) -> None:
+
+    def __init__(
+        self,
+        policy1: Policy,
+        policy2: Policy,
+        threshold: float,
+        rng: np.random.Generator | None = None,
+    ) -> None:
         super().__init__()
         self.policy1 = policy1
         self.policy2 = policy2
         self.threshold = threshold
-    
+        self.rng = rng
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if np.random.rand() < self.threshold:
+        if self.rng is None:
+            self.rng = np.random.default_rng()
+        if self.rng.random() < self.threshold:
             return self.policy1(x)
         return self.policy2(x)
+
 
 class JumpDiffusionPolicy(Policy):
     """
@@ -197,14 +224,18 @@ class JumpDiffusionPolicy(Policy):
     Attributes:
         params (JumpDiffusionConsts): Parameters of the Jump Diffusion model.
     """
+
     def __init__(self, params: JumpDiffusionConsts):
         super().__init__()
         self.params = params
-    
+
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        E_jump = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J ** 2) - 1
-        Var_jump = ((np.exp(self.params.sigma_J ** 2) - 1) *
-            np.exp(2 * self.params.mu_J + self.params.sigma_J ** 2))
-        return torch.as_tensor(self.params.mu - self.params.r - self.params.lam * E_jump /
-                (self.params.gamma * self.params.sigma ** 2 +
-                 self.params.lam * Var_jump), dtype=torch.float32)
+        E_jump = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J**2) - 1
+        Var_jump = (np.exp(self.params.sigma_J**2) - 1) * np.exp(
+            2 * self.params.mu_J + self.params.sigma_J**2
+        )
+        return torch.as_tensor(
+            (self.params.mu - self.params.r - self.params.lam * E_jump)
+            / (self.params.gamma * self.params.sigma**2 + self.params.lam * Var_jump),
+            dtype=torch.float32,
+        )
