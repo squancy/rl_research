@@ -36,7 +36,7 @@ class GeneralConsts:
 
     init_wealth: float = 1.0
     delta_t: float = 1 / 250  # daily
-    T: int = 1
+    T: int = 5
 
 
 @dataclass
@@ -50,6 +50,8 @@ class MertonConsts(GeneralConsts):
         sigma (float): Risky asset volatility (annualized).
         gamma (float): Risk aversion.
         A (float): Hyperparameter for determining time dependent risky return.
+        distr_var (float): Variance of the distribution that generates per-trajectory
+            mean and variance for the risky asset.
     """
 
     mu: float = 0.08
@@ -57,6 +59,7 @@ class MertonConsts(GeneralConsts):
     sigma: float = 0.2
     gamma: float = 5
     A: float = 0.08
+    distr_var: float = 0.1
 
 
 @dataclass

@@ -108,19 +108,19 @@ class TimeDependentMertonPolicy(MertonPolicy):
     def __init__(self, params: MertonConsts) -> None:
         super().__init__(params=params)
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, mu: float, sigma: float) -> torch.Tensor:
         """
         Computes the optimal policy for the time-dependent Merton AP model.
 
         Args:
-            state (torch.Tensor): State including risky asset return at time t (mu_t).
+            mu (float): Expected return of the risky asset for the given trajectory.
+            sigma (float): Volatility of the return of the risky asset for the trajectory.
 
         Returns:
             torch.Tensor: Optimal policy for the Merton model at time step t.
         """
-        mu_t = self.params.mu + self.params.A * np.sin(2 * np.pi * state[0])
         return torch.as_tensor(
-            (mu_t - self.params.r) / (self.params.gamma * self.params.sigma**2),
+            (mu - self.params.r) / (self.params.gamma * sigma**2),
             dtype=torch.float32,
         )
 
@@ -142,19 +142,19 @@ class TimeDependentNoisyMertonPolicy(MertonPolicy):
         self.seed = seed
         self.rng = np.random.default_rng(seed=seed)
 
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, mu: float, sigma: float) -> torch.Tensor:
         """
         Computes the optimal policy for the time-dependent Merton AP model.
 
         Args:
-            state (torch.Tensor): State including risky asset return at time t (mu_t).
+            mu (float): Expected return of the risky asset for the given trajectory.
+            sigma (float): Volatility of the return of the risky asset for the trajectory.
 
         Returns:
             torch.Tensor: Optimal policy for the Merton model at time step t.
         """
-        mu_t = state[1]
         return torch.as_tensor(
-            (mu_t - self.params.r) / (self.params.gamma * self.params.sigma**2)
+            (mu - self.params.r) / (self.params.gamma * sigma**2)
             + self.var * self.rng.standard_normal(),
             dtype=torch.float32,
         )
@@ -184,6 +184,96 @@ class NNPolicy(Policy):
         return self.pi_scale * torch.tanh(self.net(state))
 
 
+class RNNPolicy(Policy):
+    """
+    Defines an RNN policy with a GRU unit and two feed-forward layers.
+
+    Attributes:
+        probabilistic (bool = False): True, if the output should be
+            2-dimensional.
+        rnn (GRU): GRU unit.
+        head (Sequential): Two layer feed-forward network for predicting
+            a single quantity.
+        log_var_head (Sequential): Two layer feed-forward network for predicting
+            a different quantity.
+        action_scale (float | None = None): If given, the output of `tanh(self.head)`
+            is scaled by this number. Otherwise, the raw output of `self.head` is used.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 64,
+        num_layers: int = 1,
+        output_dim: int = 1,
+        action_scale: float | None = None,
+        probabilistic: bool = False,
+    ):
+        super().__init__()
+        self.probabilistic = probabilistic
+
+        self.rnn = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+        if probabilistic:
+            self.log_var_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+
+        self.action_scale = action_scale
+
+    def forward(self, x: torch.Tensor, h0: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Performs a single forward pass on the network.
+
+        Args:
+            x (torch.Tensor): Input vector of dimension (batch_size, seq_len, input_dim).
+            h0 (torch.Tensor | None = None): Optional initial hidden state of
+                shape (num_layers, batch_size, hidden_dim).
+
+        Returns:
+            torch.Tensor: (mean, log_var, h_n), if probabilistic and
+                (actions, h_n) otherwise.
+        """
+        # Handle 1D input (single timestep during rollout)
+        squeezed = False
+        if x.dim() == 1:
+            x = x.unsqueeze(0).unsqueeze(0)  # (dim,) -> (1, 1, dim)
+            squeezed = True
+        elif x.dim() == 2:
+            x = x.unsqueeze(0)  # (T, dim) -> (1, T, dim)
+            squeezed = True
+
+        rnn_out, h_n = self.rnn(x, h0)
+
+        mean = self.head(rnn_out)
+        if self.action_scale is not None:
+            mean = self.action_scale * torch.tanh(mean)
+
+        if self.probabilistic:
+            log_var = self.log_var_head(rnn_out)
+            log_var = torch.clamp(log_var, min=-6.0, max=2.0)
+            if squeezed:
+                return mean.squeeze(0), log_var.squeeze(0), h_n
+            return mean, log_var, h_n
+
+        if squeezed:
+            return mean.squeeze(0), h_n
+        return mean, h_n
+
+
 class MixturePolicy(Policy):
     """
     Implements the convex combination of two policies.
@@ -194,6 +284,7 @@ class MixturePolicy(Policy):
         policy2 (Policy): Second policy.
         threshold (float): Convex combination coefficient.
         rng (np.random.Generator | None): RNG for reproducible sampling.
+        time_dep (bool): Whether policies expect (mu, sigma) instead of state.
     """
 
     def __init__(
@@ -209,12 +300,26 @@ class MixturePolicy(Policy):
         self.threshold = threshold
         self.rng = rng
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, *args, **kwargs) -> torch.Tensor:
         if self.rng is None:
             self.rng = np.random.default_rng()
+
         if self.rng.random() < self.threshold:
-            return self.policy1(x)
-        return self.policy2(x)
+            if "mu" in kwargs and "sigma" in kwargs:
+                result = self.policy1(kwargs["mu"], kwargs["sigma"])
+            else:
+                result = self.policy1(*args, **kwargs)
+        else:
+            if "state" in kwargs:
+                result = self.policy2(kwargs["state"])
+            else:
+                result = self.policy2(*args, **kwargs)
+
+        # RNN policies return (action, h_n) or (mean, log_var, h_n);
+        # extract just the action tensor.
+        if isinstance(result, tuple):
+            return result[0]
+        return result
 
 
 class JumpDiffusionPolicy(Policy):
@@ -230,12 +335,16 @@ class JumpDiffusionPolicy(Policy):
         self.params = params
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
-        E_jump = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J**2) - 1
-        Var_jump = (np.exp(self.params.sigma_J**2) - 1) * np.exp(
+        # E[J-1] and E[(J-1)^2] for lognormal jumps
+        k = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J**2) - 1
+        Var_J = (np.exp(self.params.sigma_J**2) - 1) * np.exp(
             2 * self.params.mu_J + self.params.sigma_J**2
         )
-        return torch.as_tensor(
-            (self.params.mu - self.params.r - self.params.lam * E_jump)
-            / (self.params.gamma * self.params.sigma**2 + self.params.lam * Var_jump),
-            dtype=torch.float32,
+        E_J_minus_1_sq = Var_J + k**2  # E[(J-1)^2]
+
+        # Linearized optimal allocation (second-order approximation of HJB FOC)
+        pi_star = (self.params.mu - self.params.r) / (
+            self.params.gamma
+            * (self.params.sigma**2 + self.params.lam * E_J_minus_1_sq)
         )
+        return torch.as_tensor(pi_star, dtype=torch.float32)
