@@ -18,9 +18,10 @@ from policy import (
     JumpDiffusionPolicy,
     MertonPolicy,
     MixturePolicy,
-    NNPolicy,
     NormalizedPolicy,
     Policy,
+    RNNPolicy,
+    TimeDependentJumpDiffusionPolicy,
     TimeDependentMertonPolicy,
     TimeDependentNoisyMertonPolicy,
 )
@@ -77,6 +78,13 @@ class DAgger:
                 policy_class=JumpDiffusionPolicy
             )
             self.expert_policy = JumpDiffusionPolicy(params=JumpDiffusionConsts())
+        elif expert_policy == "time_dep_jump_diffusion":
+            self.financial_model = create_jump_diffusion_model(
+                policy_class=TimeDependentJumpDiffusionPolicy
+            )
+            self.expert_policy = TimeDependentJumpDiffusionPolicy(
+                params=JumpDiffusionConsts()
+            )
         self.state_type = state_type
         self.traj_dataset = traj_dataset
         if self.traj_dataset:
@@ -266,7 +274,9 @@ class BC:
                         loss = (w * nll_elem).mean()
                         loss = loss + self.sharpness_weight * log_var.mean()
                     else:
-                        pred, _ = self.policy(returns)
+                        out = self.policy(returns)
+                        # RNN policies return (pred, h_n); plain policies return a tensor
+                        pred = out[0] if isinstance(out, tuple) else out
                         # Temporally weighted MSE
                         loss = (w * (pred - expert_actions) ** 2).mean()
 
@@ -547,8 +557,11 @@ def compare_bc_to_fin_model(
         TimeDependentNoisyMertonPolicy,
     ]:
         fin_model = create_merton_model(policy_class=financial_policy_class)
-    elif financial_policy_class == JumpDiffusionPolicy:
-        fin_model = create_jump_diffusion_model(policy_class=JumpDiffusionPolicy)
+    elif financial_policy_class in [
+        JumpDiffusionPolicy,
+        TimeDependentJumpDiffusionPolicy,
+    ]:
+        fin_model = create_jump_diffusion_model(policy_class=financial_policy_class)
     expert_dataset = fin_model.generate_data(m=m, state_type=state_type)
     bc = BC(D=expert_dataset, policy=bc_policy, epochs=epochs)
     bc.train()
@@ -753,7 +766,6 @@ if __name__ == "__main__":
         epochs=10,
     )
 
-    """
 
     compare_bc_to_fin_model(
         financial_policy_class=JumpDiffusionPolicy,
@@ -761,11 +773,49 @@ if __name__ == "__main__":
         m=100,
         epochs=10,
         savepath="plots/bc_vs_jd.png",
+        plots_to_show=["action_time", "rollout_drift"],
     )
 
     dagger = DAgger(policy=NNPolicy(in_dim=3), expert_policy="jump_diffusion")
     dagger.train()
     jd_model = create_jump_diffusion_model(policy_class=JumpDiffusionPolicy)
     dagger.bc.compare_to_financial_model(
-        financial_model=jd_model, savepath="plots/dagger_vs_jd.png"
+        financial_model=jd_model,
+        savepath="plots/dagger_vs_jd.png",
+        plots_to_show=["action_time", "rollout_drift"],
+    )
+    """
+
+    model = create_jump_diffusion_model(policy_class=TimeDependentJumpDiffusionPolicy)
+
+    policy = RNNPolicy(input_dim=1, hidden_dim=128, probabilistic=True)
+    D = model.generate_trajectories(m=500, state_type="pomdp")
+    bc = BC(
+        D=D,
+        policy=policy,
+        lr=1e-3,
+        epochs=10,
+        batch_size=16,
+        traj_dataset=True,
+        optimizer="adam",
+    )
+    bc.train()
+    bc.diagnose_rnn(
+        financial_model=model,
+    )
+
+    dagger = DAgger(
+        expert_policy="time_dep_jump_diffusion",
+        policy=policy,
+        traj_dataset=True,
+        state_type="pomdp",
+        m=500,
+        bc_optimizer="adam",
+        bc_epochs=10,
+        bc_batch_size=16,
+        base_lr=1e-3,
+    )
+    dagger.train()
+    dagger.bc.diagnose_rnn(
+        financial_model=model,
     )

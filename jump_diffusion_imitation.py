@@ -1,3 +1,4 @@
+import math
 from typing import Type
 
 import numpy as np
@@ -5,7 +6,7 @@ import torch
 
 from consts import JumpDiffusionConsts
 from financial_model import FinancialModel
-from policy import Policy
+from policy import MixturePolicy, Policy, TimeDependentJumpDiffusionPolicy
 
 
 class JumpDiffusionModel(FinancialModel):
@@ -16,18 +17,23 @@ class JumpDiffusionModel(FinancialModel):
     Attributes:
         params (JumpDiffusionConsts): Dataclass of constants for the Jump Diffusion AP model.
         policy_class (Policy): Optimal policy class for the Jump Diffusion AP model.
+        time_dep (bool): True, if the Jump Diffusion policy is time-dependent.
     """
 
     def __init__(self, params: JumpDiffusionConsts, policy_class: Type[Policy]) -> None:
         super().__init__()
         self.params = params
         self.expert_policy = policy_class(params=params)
+        self.time_dep = isinstance(self.expert_policy, TimeDependentJumpDiffusionPolicy)
 
     def simulate_trajectory(
         self, policy: Policy, seed: int = 42, state_type: str = "default"
     ) -> list[tuple]:
         """
         Generates trajectories given an arbitrary policy.
+        In case of a time-dependent Jump Diffusion model, the mean and variance
+        of the risky asset for each trajectory are generated from a normal and
+        lognormal distribution, respectively. Otherwise, they are assumed to be constant.
 
         Args:
             policy (Policy): Policy used to generate trajectories.
@@ -37,21 +43,36 @@ class JumpDiffusionModel(FinancialModel):
         Returns:
             list[tuple]: A single simulated trajectory. Each element in
                 the trajectory is a tuple of the given state, the policy's
-                value at that state and the current wealth.
+                value at that state, the current wealth and the expert policy's
+                value at that state.
         """
         rng = np.random.default_rng(seed=seed)
         X = torch.as_tensor(self.params.init_wealth, dtype=torch.float32)
         N = int(self.params.T / self.params.delta_t)
         trajectory = []
+        R = 0
+
+        if self.time_dep:
+            mu = self.params.mu + self.params.sigma * rng.standard_normal()
+            sigma = rng.lognormal(
+                mean=math.log(self.params.sigma), sigma=self.params.sigma
+            )
+        else:
+            mu = self.params.mu
+            sigma = self.params.sigma
 
         # --- Drift correction ---
         k = np.exp(self.params.mu_J + 0.5 * self.params.sigma_J**2) - 1.0
-        mu_eff = self.params.mu - self.params.lam * k
+        mu_eff = mu - self.params.lam * k
 
         for t in range(N):
             state = torch.as_tensor(
-                [t / N, self.params.mu, torch.log(X).item()], dtype=torch.float32
+                [t / N, mu, torch.log(X).item()], dtype=torch.float32
             )
+            if state_type == "full":
+                state = torch.as_tensor([t / N, mu, sigma], dtype=torch.float32)
+            elif state_type == "pomdp":
+                state = torch.as_tensor([R], dtype=torch.float32)
 
             # --- Jumps ---
             J_t = rng.poisson(self.params.lam * self.params.delta_t)
@@ -66,8 +87,17 @@ class JumpDiffusionModel(FinancialModel):
             jump = np.exp(log_jump)
 
             # --- Policy ---
-            pi = policy(state)
-            pi_star = self.expert_policy(state)
+            if self.time_dep and isinstance(policy, MixturePolicy):
+                pi = policy(state=state, mu=mu, sigma=sigma)
+            elif self.time_dep and isinstance(policy, TimeDependentJumpDiffusionPolicy):
+                pi = policy(mu, sigma)
+            else:
+                pi = policy(state)
+
+            if self.time_dep:
+                pi_star = self.expert_policy(mu, sigma)
+            else:
+                pi_star = self.expert_policy(state)
 
             # --- Diffusion ---
             epsilon = rng.standard_normal()
@@ -75,7 +105,7 @@ class JumpDiffusionModel(FinancialModel):
             R_diffuse = (
                 1
                 + mu_eff * self.params.delta_t
-                + self.params.sigma * self.params.delta_t**0.5 * epsilon
+                + sigma * self.params.delta_t**0.5 * epsilon
             )
 
             R = R_diffuse * jump - 1

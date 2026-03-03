@@ -84,3 +84,67 @@ class JumpDiffusionConsts(GeneralConsts):
     lam: float = 0.5
     mu_J: float = -0.2
     sigma_J: float = 0.1
+    distr_var: float = 0.1
+
+
+@dataclass
+class PPOConfig:
+    """
+    All PPO hyperparameters.
+
+    Attributes:
+        n_envs (int): Number of environments (trajectories).
+        state_type (str): Type of the state used in trajectories.
+        reward_type (str): Type of reward used in trajectories.
+        hidden_dim (int): Hidden layer dimension size in the actor-critic network.
+        action_scale (float): Number by which to scale actions.
+        init_log_std (float): Initial log standard deviation.
+        total_timesteps (int): Total number of timestaps to take.
+        rollout_steps (int): Number of steps to take per episode.
+        n_epochs (int): Number of epochs for PPO.
+        batch_size (int): Batch size for PPO.
+        gamma (float): Discount factor.
+        gae_lambda (float): Lambda for generalized advantage estimation.
+        clip_eps (float): Epsilon to use for clipping the PPO objective.
+        vf_coef (float): Coefficient to use for the value function estimate
+            in the loss function.
+        ent_coef (float): Coefficient to use for the entropy estimate
+            in the loss function.
+        max_grad_norm (float): Maximum gradient norm used for gradient clipping.
+        lr (float): Learning rate.
+        eval_interval (int): Evaluate every N timesteps.
+        eval_episodes (int): Number of episodes to evaluate on.
+        eval_seed (int): Evaluation seed to reset the env.
+        eval_base_seed (int): Evaluation starting seed.
+    """
+
+    # Environment
+    n_envs: int = 16
+    state_type: str = "default"
+    reward_type: str = "crra"
+
+    # Network
+    hidden_dim: int = 64
+    action_scale: float = 20.0
+    init_log_std: float = -0.5
+
+    # PPO
+    total_timesteps: int = 500_000
+    rollout_steps: int = 1250  # One full episode
+    n_epochs: int = 10  # PPO update epochs per rollout
+    batch_size: int = 256
+    gamma: float = 0.999
+    gae_lambda: float = 0.95
+    clip_eps: float = 0.2
+    vf_coef: float = 0.5
+    ent_coef: float = 0.01
+    max_grad_norm: float = 0.5
+    lr: float = 3e-4
+
+    # Evaluation
+    eval_interval: int = 10_000  # Evaluate every N timesteps
+    eval_episodes: int = 100
+    eval_seed: int = SystemConsts.test_base_seed_policy
+
+    # Seeding
+    env_base_seed: int = 7000
