@@ -3,7 +3,7 @@ import math
 import numpy as np
 import torch
 
-from consts import MertonConsts
+from utils.consts import MertonConsts
 
 
 class MertonEnv:
@@ -74,9 +74,9 @@ class MertonEnv:
             self.rng = np.random.default_rng(seed=seed)
 
         # Sample per-trajectory mu, sigma (time-dependent Merton)
-        self.mu = self.params.mu + self.params.sigma * self.rng.standard_normal()
+        self.mu = self.params.mu + self.params.distr_var * self.rng.standard_normal()
         self.sigma = self.rng.lognormal(
-            mean=math.log(self.params.sigma), sigma=self.params.sigma
+            mean=math.log(self.params.sigma), sigma=self.params.distr_var
         )
 
         self.X = self.params.init_wealth

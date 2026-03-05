@@ -75,6 +75,7 @@ class JumpDiffusionConsts(GeneralConsts):
         lam (float): Intensity of the Poisson process.
         mu_J (float): Mean of jump.
         sigma_J (float): Variance of jump.
+        distr_var (float): Variance of the distribution for per-trajectory sampling.
     """
 
     mu: float = 0.08

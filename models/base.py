@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
-from consts import SystemConsts
-from policy import Policy
+from policies.base import Policy
+from utils.consts import SystemConsts
 
 
 class FinancialModel(ABC):

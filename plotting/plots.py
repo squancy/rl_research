@@ -26,10 +26,8 @@ class Plots:
 
         plt.rcParams.update(
             {
-                "font.family": "sans-serif",
                 "font.size": 11,
                 "axes.titlesize": 13,
-                "axes.titleweight": "bold",
                 "axes.labelsize": 11,
                 "legend.fontsize": 9,
                 "xtick.labelsize": 9,
@@ -223,7 +221,6 @@ class Plots:
                     ha="center",
                     va="bottom",
                     fontsize=9,
-                    fontweight="bold",
                 )
 
         self._plot_fns.append(_plot)

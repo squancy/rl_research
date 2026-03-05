@@ -22,3 +22,7 @@ def seed_everything(seed: int):
     g = torch.Generator()
     g.manual_seed(seed)
     return g
+
+
+# Global seeded generator used for reproducible data loading
+g = seed_everything(seed=42)

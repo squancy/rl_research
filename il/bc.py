@@ -8,162 +8,22 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from consts import JumpDiffusionConsts, MertonConsts, SystemConsts
-from datasets import ExpertDataset, TrajectoryDataset
-from financial_model import FinancialModel
-from jump_diffusion_imitation import create_jump_diffusion_model
-from merton_imitation import create_merton_model
-from plots import Plots
-from policy import (
+from il.datasets import ExpertDataset, TrajectoryDataset
+from models.base import FinancialModel
+from models.jump_diffusion import create_jump_diffusion_model
+from models.merton import create_merton_model
+from plotting.plots import Plots
+from policies.analytic import (
     JumpDiffusionPolicy,
     MertonPolicy,
-    MixturePolicy,
-    NormalizedPolicy,
-    Policy,
-    RNNPolicy,
     TimeDependentJumpDiffusionPolicy,
     TimeDependentMertonPolicy,
     TimeDependentNoisyMertonPolicy,
 )
-from seed import seed_everything
-
-g = seed_everything(seed=42)
-
-
-class DAgger:
-    """
-    DAgger implementation.
-
-    Attributes:
-        financial_model (FinancialModel): Financial model with the expert policy.
-        expert_dataset (list[tuple[Tensor, Tensor]]): Expert trajectories.
-        epochs (int = 10): Number of epochs during training.
-        batch_size (int = 32): Batch size.
-        policy (Policy): Our policy.
-        expert_policy (Policy): Expert policy.
-        K (int = 5): Number of learner rollouts in each epoch.
-        base_lr (float): Initial learning rate for DAgger. It will decay as the dataset grows.
-        state_type (str = "default"): Determines what the states should be.
-        traj_dataset (bool = False): Whether to use the per-trajectory dataset or not.
-        bc_optimizer (str = "sgd"): Optimizer to use for BC.
-        bc_epochs (int = 10): Number of epochs to use for BC.
-        bc_batch_size (int = 32): Batch size to use for BC.
-    """
-
-    def __init__(
-        self,
-        policy: Policy,
-        epochs: int = 10,
-        batch_size: int = 32,
-        expert_policy: str = "merton",
-        K: int = 5,
-        m: int = 100,
-        base_lr: float = 3e-4,
-        state_type: str = "default",
-        traj_dataset: bool = False,
-        bc_optimizer: str = "sgd",
-        bc_epochs: int = 10,
-        bc_batch_size: int = 32,
-    ) -> None:
-        if expert_policy == "merton":
-            self.financial_model = create_merton_model(policy_class=MertonPolicy)
-            self.expert_policy = MertonPolicy(params=MertonConsts())
-        elif expert_policy == "time_dep_merton":
-            self.financial_model = create_merton_model(
-                policy_class=TimeDependentMertonPolicy
-            )
-            self.expert_policy = TimeDependentMertonPolicy(params=MertonConsts())
-        elif expert_policy == "jump_diffusion":
-            self.financial_model = create_jump_diffusion_model(
-                policy_class=JumpDiffusionPolicy
-            )
-            self.expert_policy = JumpDiffusionPolicy(params=JumpDiffusionConsts())
-        elif expert_policy == "time_dep_jump_diffusion":
-            self.financial_model = create_jump_diffusion_model(
-                policy_class=TimeDependentJumpDiffusionPolicy
-            )
-            self.expert_policy = TimeDependentJumpDiffusionPolicy(
-                params=JumpDiffusionConsts()
-            )
-        self.state_type = state_type
-        self.traj_dataset = traj_dataset
-        if self.traj_dataset:
-            self.expert_dataset = self.financial_model.generate_trajectories(
-                m=m, state_type=self.state_type
-            )
-        else:
-            self.expert_dataset = self.financial_model.generate_data(
-                m=m, state_type=self.state_type
-            )
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.policy = policy
-        self.K = K
-        self.expert_policy.eval()
-        for p in self.expert_policy.parameters():
-            p.requires_grad_(False)
-        self.system_consts = SystemConsts()
-        self.base_lr = base_lr
-        self.bc_optimizer = bc_optimizer
-        self.traj_dataset = traj_dataset
-        self.bc_epochs = bc_epochs
-        self.bc_batch_size = bc_batch_size
-
-    def train(self):
-        """
-        Trains DAgger on the expert dataset.
-        """
-        self.bc = BC(
-            D=self.expert_dataset,
-            policy=self.policy,
-            lr=self.base_lr,
-            optimizer=self.bc_optimizer,
-            epochs=self.bc_epochs,
-            batch_size=self.bc_batch_size,
-            traj_dataset=self.traj_dataset,
-        )
-        N_0 = len(cast(Sized, self.bc.dataloader.dataset))
-        for t in range(self.epochs):
-            print(f"DAgger Epoch {t + 1}\n-------------------------")
-            N_t = len(cast(Sized, self.bc.dataloader.dataset))
-            E_t = int(min(20, np.ceil(10 * N_t / N_0)))
-            self.bc.epochs = E_t
-            lr_t = self.base_lr * np.sqrt(N_0 / N_t)
-            for param_group in self.bc.optimizer.param_groups:
-                param_group["lr"] = lr_t
-            batch_size_t = max(
-                16, int(self.bc.dataloader.batch_size * np.sqrt(N_0 / N_t))
-            )
-            self.bc.dataloader = DataLoader(
-                self.bc.dataset,
-                batch_size=batch_size_t,
-                shuffle=True,
-                generator=g,
-                num_workers=0,
-            )
-            self.bc.train()
-            rollout_seed = self.system_consts.dagger_base_seed + t * self.K
-            rollout_rng = np.random.default_rng(seed=rollout_seed)
-            mixture_policy = MixturePolicy(
-                policy1=self.expert_policy,
-                policy2=self.bc.policy,
-                threshold=max(0.0, 1.0 - t / self.epochs),
-                rng=rollout_rng,
-            )
-            for k in range(self.K):
-                with torch.no_grad():
-                    traj = self.financial_model.simulate_trajectory(
-                        policy=mixture_policy,
-                        seed=self.system_consts.dagger_base_seed + t * self.K + k,
-                        state_type=self.state_type,
-                    )
-                states = []
-                expert_actions = []
-                for state, _, _, pi_star in traj:
-                    states.append(state.detach().clone())
-                    expert_actions.append(pi_star.detach().clone())
-                self.bc.dataset.add(states=states, actions=expert_actions)
-            print(f"Dataset size after epoch {t + 1}: {len(self.bc.dataset)}")
+from policies.base import Policy
+from policies.wrappers import NormalizedPolicy
+from utils.consts import SystemConsts
+from utils.seed import g
 
 
 class BC:
@@ -317,6 +177,8 @@ class BC:
         n_trajectories: int = 8,
         state_type: str = "pomdp",
         device=None,
+        savepath: str | None = None,
+        dpi: int = 300,
     ):
         """
         Plots expert vs predicted allocations for multiple held-out trajectories.
@@ -328,6 +190,8 @@ class BC:
             n_trajectories (int): Number of trajectories to plot.
             state_type (str): State type for generating test trajectories.
             device: Optional device to move tensors to.
+            savepath (str | None): Path to save the figure. If None, only displays.
+            dpi (int): DPI resolution of the saved figure.
         """
         self.policy.eval()
 
@@ -427,6 +291,8 @@ class BC:
         ax.grid(True, linestyle=":", alpha=0.5)
 
         fig.tight_layout()
+        if savepath:
+            fig.savefig(savepath, dpi=dpi, bbox_inches="tight")
         plt.show()
 
     @torch.no_grad()
@@ -571,251 +437,4 @@ def compare_bc_to_fin_model(
         savepath=savepath,
         dpi=dpi,
         plots_to_show=plots_to_show,
-    )
-
-
-if __name__ == "__main__":
-    """
-    # Evaluate BC using the Merton model, 4 trajectories and 5 epochs
-    # This is enough for BC to learn the optimal policy
-    # Adding more trajectories to the training set stabilizes the learning a little
-    # more but does not have an effect on performance
-    policy = LinearPolicy(in_features=3)
-    compare_bc_to_fin_model(
-        financial_policy_class=MertonPolicy,
-        bc_policy=policy,
-        m=10,
-        epochs=5,
-        savepath="plots/bc_vs_constant_merton.png",
-        dpi=600,
-    )
-
-    # Weights are close to zero and the bias term is approximately
-    # the optimal policy, as expected
-    for name, param in policy.named_parameters():
-        print(name, param.shape)
-        print(param)
-    # Evaluate BC on a distribution shift using 4 trajectories and 5 epochs
-    merton_model = create_merton_model(policy_class=MertonPolicy)
-    expert_dataset = merton_model.generate_data(m=4)
-    bc = BC(D=expert_dataset, policy=LinearPolicy(in_features=3), epochs=4)
-    bc.train()
-    merton_model.params.sigma = 0.4
-
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        m=10,
-        plots_to_show=["action_time", "terminal_wealth", "expected_utility"],
-        dpi=600,
-        savepath="plots/bc_vs_constant_merton_distr_shift.png",
-    )
-    # Evaluate BC against a time-dependent Merton policy in a POMDP setting
-    # States only contain returns and wealths, so BC has to infer the distribution
-    # of the mean and volatility of returns
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m=100)
-    bc = BC(D=expert_dataset, policy=NNPolicy(in_dim=3), epochs=10)
-    bc.train()
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/bc_vs_timedep_merton_1year.png",
-        dpi=600,
-        m=10,
-        plots_to_show=["action_time"],
-        n_action_time_trajectories=3,
-    )
-
-    # Evaluate BC against a time-dependent merton policy but the states now
-    # contain the actual mean and volatility for each trajectory
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m=100, state_type="full")
-    bc = BC(D=expert_dataset, policy=NNPolicy(in_dim=3), epochs=10)
-    bc.train()
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/bc_vs_timedep_merton_full_obs.png",
-        dpi=600,
-        m=10,
-        state_type="full",
-        n_action_time_trajectories=3,
-    )
-
-    # Evaluate DAgger against a time-dependent Merton policy using 1-year
-    # trajectories in a POMDP setting
-    dagger = DAgger(expert_policy="time_dep_merton", policy=NNPolicy(in_dim=3))
-    dagger.train()
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    dagger.bc.compare_to_financial_model(
-        financial_model=merton_model,
-        m=10,
-        savepath="plots/dagger_vs_time_dep_merton_1year.png",
-        dpi=600,
-        plots_to_show="action_time",
-        is_bc=False,
-        n_action_time_trajectories=3,
-    )
-
-    # Evaluate behavior cloning using the time-dependent Merton model
-    # Using longer trajectories (15-20 years of trading or more) significantly
-    # improves the performance
-    # Now, states also contain the empirical mean and variance of the returns up
-    # to time t
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m=10, state_type="statistic")
-    bc = BC(D=expert_dataset, policy=NNPolicy(in_dim=3), epochs=10)
-    bc.train()
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/bc_vs_timedep_merton_20year.png",
-        dpi=600,
-        m=10,
-        plots_to_show=["action_time"],
-        state_type="statistic",
-        n_action_time_trajectories=3,
-    )
-    model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-
-    policy = RNNPolicy(input_dim=1, hidden_dim=128, probabilistic=True)
-    D = model.generate_trajectories(m=500, state_type="pomdp")
-    bc = BC(
-        D=D,
-        policy=policy,
-        lr=1e-3,
-        epochs=10,
-        batch_size=16,
-        traj_dataset=True,
-        optimizer="adam",
-    )
-    bc.train()
-    bc.diagnose_rnn(
-        financial_model=model,
-    )
-
-    model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-
-    policy = RNNPolicy(input_dim=1, hidden_dim=128, probabilistic=True)
-    dagger = DAgger(
-        expert_policy="time_dep_merton",
-        policy=policy,
-        traj_dataset=True,
-        state_type="pomdp",
-        m=500,
-        bc_optimizer="adam",
-        bc_epochs=10,
-        bc_batch_size=16,
-        base_lr=1e-3,
-    )
-    dagger.train()
-    dagger.bc.diagnose_rnn(
-        financial_model=model,
-    )
-
-    dagger = DAgger(
-        expert_policy="time_dep_merton", policy=NNPolicy(in_dim=4), epochs=5
-    )
-    dagger.train()
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    dagger.bc.compare_to_financial_model(
-        financial_model=merton_model,
-        m=5,
-        savepath="plots/dagger_vs_time_dep_merton.png",
-        dpi=600,
-    )
-
-    # Distribution shift
-    # Evaluate the time-dependent Merton model using a different
-    # risky asset return than it was trained on
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m=100)
-    bc = BC(D=expert_dataset, policy=LinearPolicy(in_features=4), epochs=10)
-    bc.train()
-    merton_model.params.A = 0.35
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/bc_vc_time_dep_merton_mu_distr_shift.png",
-        dpi=600,
-    )
-
-    # Evaluate the time-dependent Merton model using a different
-    # risky asset volatility than it was trained on
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_dataset = merton_model.generate_data(m=100)
-    bc = BC(D=expert_dataset, policy=LinearPolicy(in_features=4), epochs=10)
-    bc.train()
-    merton_model.params.sigma = 0.4
-    bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/bc_vc_time_dep_merton_sigma_distr_shift.png",
-        dpi=600,
-    )
-
-    dagger = DAgger(expert_policy="time_dep_merton", policy=NNPolicy(in_dim=4))
-    dagger.train()
-    merton_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    merton_model.params.sigma = 0.4
-    dagger.bc.compare_to_financial_model(
-        financial_model=merton_model,
-        savepath="plots/dagger_vc_time_dep_merton_sigma_distr_shift.png",
-        dpi=600,
-    )
-
-    compare_bc_to_fin_model(
-        financial_policy_class=JumpDiffusionPolicy,
-        bc_policy=NNPolicy(in_dim=3),
-        m=100,
-        epochs=10,
-    )
-
-
-    compare_bc_to_fin_model(
-        financial_policy_class=JumpDiffusionPolicy,
-        bc_policy=NNPolicy(in_dim=3),
-        m=100,
-        epochs=10,
-        savepath="plots/bc_vs_jd.png",
-        plots_to_show=["action_time", "rollout_drift"],
-    )
-
-    dagger = DAgger(policy=NNPolicy(in_dim=3), expert_policy="jump_diffusion")
-    dagger.train()
-    jd_model = create_jump_diffusion_model(policy_class=JumpDiffusionPolicy)
-    dagger.bc.compare_to_financial_model(
-        financial_model=jd_model,
-        savepath="plots/dagger_vs_jd.png",
-        plots_to_show=["action_time", "rollout_drift"],
-    )
-    """
-
-    model = create_jump_diffusion_model(policy_class=TimeDependentJumpDiffusionPolicy)
-
-    policy = RNNPolicy(input_dim=1, hidden_dim=128, probabilistic=True)
-    D = model.generate_trajectories(m=500, state_type="pomdp")
-    bc = BC(
-        D=D,
-        policy=policy,
-        lr=1e-3,
-        epochs=10,
-        batch_size=16,
-        traj_dataset=True,
-        optimizer="adam",
-    )
-    bc.train()
-    bc.diagnose_rnn(
-        financial_model=model,
-    )
-
-    dagger = DAgger(
-        expert_policy="time_dep_jump_diffusion",
-        policy=policy,
-        traj_dataset=True,
-        state_type="pomdp",
-        m=500,
-        bc_optimizer="adam",
-        bc_epochs=10,
-        bc_batch_size=16,
-        base_lr=1e-3,
-    )
-    dagger.train()
-    dagger.bc.diagnose_rnn(
-        financial_model=model,
     )

@@ -4,14 +4,14 @@ from typing import Type
 import numpy as np
 import torch
 
-from consts import MertonConsts
-from financial_model import FinancialModel
-from policy import (
-    MixturePolicy,
-    Policy,
+from models.base import FinancialModel
+from policies.analytic import (
     TimeDependentMertonPolicy,
     TimeDependentNoisyMertonPolicy,
 )
+from policies.base import Policy
+from policies.wrappers import MixturePolicy
+from utils.consts import MertonConsts
 
 
 class MertonModel(FinancialModel):
@@ -62,9 +62,9 @@ class MertonModel(FinancialModel):
         trajectory = []
 
         if self.time_dep:
-            mu = self.params.mu + self.params.sigma * rng.standard_normal()
+            mu = self.params.mu + self.params.distr_var * rng.standard_normal()
             sigma = rng.lognormal(
-                mean=math.log(self.params.sigma), sigma=self.params.sigma
+                mean=math.log(self.params.sigma), sigma=self.params.distr_var
             )
         else:
             mu = self.params.mu

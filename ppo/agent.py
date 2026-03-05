@@ -5,57 +5,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from scipy.stats import gaussian_kde
 from torch.distributions import Normal
 
-from consts import MertonConsts, PPOConfig
-from merton_imitation import create_merton_model
-from policy import NNPolicy, NormalizedPolicy, Policy, TimeDependentMertonPolicy
-from ppo_env import MertonEnv, VectorizedMertonEnv
-from seed import seed_everything
+from models.merton import create_merton_model
+from plotting.utils import plot_kde
+from policies.analytic import TimeDependentMertonPolicy
+from policies.base import Policy
+from policies.learnable import NNPolicy
+from policies.wrappers import NormalizedPolicy
+from ppo.env import MertonEnv, VectorizedMertonEnv
+from utils.consts import MertonConsts, PPOConfig
+from utils.seed import seed_everything
 
 g = seed_everything(seed=42)
-
-
-def _plot_kde(
-    ax,
-    data: np.ndarray,
-    color: str,
-    label: str,
-    linestyle: str = "-",
-    alpha: float = 0.85,
-    fill_alpha: float = 0.10,
-    xlim: tuple[float, float] | None = None,
-) -> None:
-    """
-    Plot a KDE curve with optional fill on the given axes.
-
-    Args:
-        data (np.ndarray): Data to plot.
-        color (str): Color of the KDE plot.
-        label (str): Label of the plot.
-        linestyle (str = "-"): Line style of the plot.
-        alpha (float = 0.85): Transparency of the plot.
-        fill_alpha (float = 0.10): Transparency of the fill.
-        xlim (tuple[float, float]): Lower and upper bound for values
-            on the the x-axis.
-    """
-    data = np.asarray(data).ravel()
-    data = data[np.isfinite(data)]
-    if len(data) < 2:
-        return
-    if xlim is not None:
-        data = data[(data >= xlim[0]) & (data <= xlim[1])]
-        if len(data) < 2:
-            return
-        xs = np.linspace(xlim[0], xlim[1], 400)
-    else:
-        pad = 0.05 * (data.max() - data.min())
-        xs = np.linspace(data.min() - pad, data.max() + pad, 400)
-    kde = gaussian_kde(data)
-    ys = kde(xs)
-    ax.plot(xs, ys, color=color, alpha=alpha, lw=2, linestyle=linestyle, label=label)
-    ax.fill_between(xs, ys, alpha=fill_alpha, color=color)
 
 
 class PPOActorCritic(nn.Module):
@@ -746,14 +708,14 @@ class PPO:
         pad = 0.05 * (hi - lo)
         xlim = (max(0, lo - pad), hi + pad)
         if include_expert:
-            _plot_kde(
+            plot_kde(
                 ax,
                 X_expert[np.isfinite(X_expert)],
                 color="#2d3436",
                 label="Expert",
                 xlim=xlim,
             )
-        _plot_kde(ax, X_ppo, color="#0984e3", label="PPO", linestyle="--", xlim=xlim)
+        plot_kde(ax, X_ppo, color="#0984e3", label="PPO", linestyle="--", xlim=xlim)
         ax.set_xlim(xlim)
         ax.set_xlabel("Terminal wealth")
         ax.set_ylabel("Density")
@@ -766,232 +728,3 @@ class PPO:
             fig.savefig(savepath, dpi=dpi, bbox_inches="tight")
         plt.show()
         plt.close(fig)
-
-
-def compare_ppo_vs_il_ppo(
-    il_policy: NNPolicy | None = None,
-    il_mean: torch.Tensor | None = None,
-    il_std: torch.Tensor | None = None,
-    config: PPOConfig | None = None,
-    savepath: str | None = None,
-    dpi: int = 300,
-) -> tuple[PPO, PPO | None]:
-    """
-    Run PPO from scratch and (optionally) IL-pretrained PPO side by side.
-
-    Args:
-        il_policy (NNPolicy | None = None): Pre-trained NNPolicy from BC or DAgger (optional).
-        il_mean (torch.Tensor | None = None): State mean from IL training dataset.
-        il_std (torch.Tensor | None = None): State std from IL training dataset.
-        config (PPOConfig | None = None): PPO configuration.
-        savepath (str | None = None): Path to save comparison plot.
-        dpi (int = 300): DPI resolution of the plot.
-
-    Returns:
-        tuple[PPO, PPO]: PPO scratch and PPO pretrained: the two trained PPO instances.
-    """
-    config = config or PPOConfig()
-
-    print("=" * 60)
-    print("Training PPO from scratch")
-    print("=" * 60)
-    ppo_scratch = PPO(config)
-    ppo_scratch.train()
-
-    ppo_pretrained = None
-    if il_policy is not None:
-        print("\n" + "=" * 60)
-        print("Training PPO with IL pre-training")
-        print("=" * 60)
-        ppo_pretrained = PPO(config)
-        ppo_pretrained.load_pretrained_actor(il_policy, il_mean, il_std)
-        ppo_pretrained.train()
-
-    fin_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    expert_util = fin_model.evaluate(
-        policy=fin_model.expert_policy,
-        m=config.eval_episodes,
-        expert=True,
-        state_type=config.state_type,
-    )
-    X_expert = fin_model.terminal_wealths(
-        policy=fin_model.expert_policy,
-        m=config.eval_episodes,
-        expert=True,
-        state_type=config.state_type,
-    )
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-
-    # 1) Learning curves — y-axis clipped to readable range
-    ax = axes[0]
-    ax.plot(
-        ppo_scratch.eval_steps,
-        ppo_scratch.eval_utilities,
-        color="#d63031",
-        lw=2,
-        label="PPO (random init)",
-    )
-    if ppo_pretrained is not None:
-        ax.plot(
-            ppo_pretrained.eval_steps,
-            ppo_pretrained.eval_utilities,
-            color="#0984e3",
-            lw=2,
-            label="PPO (IL pre-trained)",
-        )
-    ax.axhline(
-        expert_util,
-        color="#2d3436",
-        linestyle="--",
-        lw=1.5,
-        label=f"Expert ({expert_util:.4f})",
-    )
-    # Symlog y-axis: linear near zero (where expert lives) and
-    # log-compressed for extreme negatives from random-init PPO.
-    linthresh = max(1.0, abs(expert_util) * 20)
-    ax.set_yscale("symlog", linthresh=linthresh)
-    # Set y-limits: top slightly above expert, bottom covers all data
-    all_utils = ppo_scratch.eval_utilities[:]
-    if ppo_pretrained is not None:
-        all_utils += ppo_pretrained.eval_utilities
-    finite_utils = [u for u in all_utils if np.isfinite(u)]
-    if finite_utils:
-        y_bottom = min(finite_utils) * 1.5
-    else:
-        y_bottom = expert_util * 100
-    y_top = abs(expert_util) * 2 if expert_util < 0 else expert_util * 1.5
-    ax.set_ylim(bottom=y_bottom, top=y_top)
-    ax.set_xlabel("Environment steps")
-    ax.set_ylabel(r"Expected utility $\mathbb{E}[U(X_T)]$")
-    ax.set_title("Sample Efficiency: PPO vs IL+PPO")
-    ax.legend(fontsize=8)
-    ax.grid(True, linestyle=":", alpha=0.5)
-
-    # 2) Median terminal wealth over training
-    ax = axes[1]
-    ax.plot(
-        ppo_scratch.eval_steps,
-        ppo_scratch.eval_mean_wealth,
-        color="#d63031",
-        lw=2,
-        label="PPO (random init)",
-    )
-    if ppo_pretrained is not None:
-        ax.plot(
-            ppo_pretrained.eval_steps,
-            ppo_pretrained.eval_mean_wealth,
-            color="#0984e3",
-            lw=2,
-            label="PPO (IL pre-trained)",
-        )
-    ax.axhline(
-        np.median(X_expert),
-        color="#2d3436",
-        linestyle="--",
-        lw=1.5,
-        label=f"Expert ({np.median(X_expert):.2f})",
-    )
-    ax.set_xlabel("Environment steps")
-    ax.set_ylabel(r"Median $X_T$")
-    ax.set_title("Median Terminal Wealth")
-    ax.legend(fontsize=8)
-    ax.grid(True, linestyle=":", alpha=0.5)
-
-    # 3) Terminal wealth distribution (KDE)
-    ax = axes[2]
-    eval_scratch = ppo_scratch.get_eval_policy()
-    X_scratch = fin_model.terminal_wealths(
-        policy=eval_scratch, m=config.eval_episodes, state_type=config.state_type
-    )
-    X_expert_f = X_expert[np.isfinite(X_expert)]
-    X_scratch_f = X_scratch[np.isfinite(X_scratch)]
-    all_wealth = [X_expert_f, X_scratch_f]
-    if ppo_pretrained is not None:
-        eval_pre = ppo_pretrained.get_eval_policy()
-        X_pre = fin_model.terminal_wealths(
-            policy=eval_pre, m=config.eval_episodes, state_type=config.state_type
-        )
-        X_pre_f = X_pre[np.isfinite(X_pre)]
-        all_wealth.append(X_pre_f)
-    combined = np.concatenate(all_wealth)
-    lo, hi = np.percentile(combined, [1, 95])
-    pad = 0.05 * (hi - lo)
-    xlim = (max(0, lo - pad), hi + pad)
-    _plot_kde(ax, X_expert_f, color="#2d3436", label="Expert", xlim=xlim)
-    _plot_kde(
-        ax,
-        X_scratch_f,
-        color="#d63031",
-        label="PPO (random)",
-        linestyle="--",
-        xlim=xlim,
-    )
-    if ppo_pretrained is not None:
-        _plot_kde(
-            ax,
-            X_pre_f,
-            color="#0984e3",
-            label="PPO (IL pre-trained)",
-            linestyle="-.",
-            xlim=xlim,
-        )
-    ax.set_xlim(xlim)
-    ax.set_xlabel("Terminal wealth $X_T$")
-    ax.set_ylabel("Density")
-    ax.set_title("Terminal Wealth Distribution")
-    ax.legend(fontsize=8)
-    ax.grid(True, linestyle=":", alpha=0.5)
-
-    fig.tight_layout()
-    if savepath:
-        fig.savefig(savepath, dpi=dpi, bbox_inches="tight")
-    plt.show()
-    plt.close(fig)
-
-    return ppo_scratch, ppo_pretrained
-
-
-if __name__ == "__main__":
-    from il import BC
-
-    config = PPOConfig(
-        total_timesteps=500_000,
-        n_envs=16,
-        rollout_steps=1250,
-        eval_interval=20_000,
-        state_type="default",
-    )
-
-    # 1) Train BC to get a pre-trained policy
-    print("=" * 60)
-    print("Phase 1: Pre-training with Behavior Cloning")
-    print("=" * 60)
-    fin_model = create_merton_model(policy_class=TimeDependentMertonPolicy)
-    trajectories = fin_model.generate_trajectories(m=100, state_type="default")
-    il_policy = NNPolicy(in_dim=3, pi_scale=20.0)
-    bc = BC(
-        D=trajectories,
-        policy=il_policy,
-        lr=1e-3,
-        epochs=10,
-        batch_size=16,
-        traj_dataset=False,
-        optimizer="adam",
-    )
-    bc.train()
-
-    il_mean = bc.dataset.mean
-    il_std = bc.dataset.std
-
-    # 2) Compare PPO (random) vs PPO (IL pre-trained)
-    print("\n" + "=" * 60)
-    print("Phase 2: PPO Training")
-    print("=" * 60)
-    ppo_scratch, ppo_pretrained = compare_ppo_vs_il_ppo(
-        il_policy=il_policy,
-        il_mean=il_mean,
-        il_std=il_std,
-        config=config,
-        savepath="plots/ppo_vs_il_ppo.png",
-    )
